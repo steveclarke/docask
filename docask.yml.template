@@ -1,0 +1,16 @@
+---
+name: docs
+vector_store_id: 
+includes:
+- docs/**/*.{md,mdx,markdown,pdf}
+excludes:
+- "**/.git/**"
+- "**/node_modules/**"
+- "**/.docask_state.json"
+- "**/.DS_Store"
+debounce_ms: 1200
+batch_max: 25
+retries:
+  max_attempts: 5
+  base_delay: 0.5
+  max_delay: 8
