@@ -8,7 +8,14 @@ require "set"
 require "openai"
 require "listen"
 
+# Path to the local JSON file that tracks upload state for each source
+# document. The file is used to make future sync runs incremental by
+# comparing SHA-256 digests of files that have already been uploaded.
 STATE_FILE = ".docask_state.json"
+
+# Default configuration values applied before merging in `docask.yml` (if
+# present). These defaults allow DocAsk to be dropped into a repository with a
+# conventional `docs/` directory and run immediately.
 DEFAULT_CFG = {
   "name" => "docs",
   "vector_store_id" => nil,
@@ -20,6 +27,12 @@ DEFAULT_CFG = {
 }
 
 class DocAsk
+  # Build a new DocAsk client using environment configuration and the optional
+  # repository-local YAML file (`docask.yml`). The OpenAI API key must be
+  # exposed in either `OPENAI_ACCESS_TOKEN` or `OPENAI_API_KEY`.
+  #
+  # @raise [RuntimeError] if no compatible OpenAI key is present in the
+  #   environment.
   def initialize
     token = ENV["OPENAI_ACCESS_TOKEN"] || ENV["OPENAI_API_KEY"]
     raise "Set OPENAI_ACCESS_TOKEN or OPENAI_API_KEY" unless token
@@ -28,6 +41,14 @@ class DocAsk
     @retry_cfg = DEFAULT_CFG["retries"].merge(@cfg["retries"] || {})
   end
 
+  # Create a new vector store via the OpenAI Assistants API, printing the
+  # resulting identifier and persisting it into `docask.yml` (if the file is
+  # writable).
+  #
+  # @param name [String, nil] Optional store name, defaulting to the configured
+  #   value (`@cfg["name"]`).
+  # @param expires_hours [Integer] The desired expiration horizon in hours.
+  # @return [void]
   def init(name: nil, expires_hours: 24)
     name ||= @cfg["name"]
     resp = with_retries { @client.vector_stores.create(parameters: {
@@ -40,6 +61,17 @@ class DocAsk
     persist_yaml("docask.yml") { |y| y["vector_store_id"] = id; y }
   end
 
+  # Upsert matching documentation files into an existing vector store. The
+  # method hashes every candidate file, uploading only new or changed content,
+  # and reports totals to stdout.
+  #
+  # @param vector_store_id [String] Identifier of the OpenAI vector store that
+  #   should receive the documents.
+  # @param includes [Array<String>, nil] Optional override for include globs.
+  # @param excludes [Array<String>, nil] Optional override for exclude globs.
+  # @return [void]
+  # @raise [RuntimeError] if no documents are discovered even after applying a
+  #   repo-wide fallback glob.
   def sync(vector_store_id:, includes: nil, excludes: nil)
     includes ||= @cfg["includes"]
     excludes ||= @cfg["excludes"]
@@ -66,6 +98,15 @@ class DocAsk
     $stdout.puts "done: #{counts[:updated]} updated, #{counts[:skipped]} skipped"
   end
 
+  # Continuously observe a directory for documentation changes, batching file
+  # events with a debounce timer and processing them in groups up to the
+  # configured `batch_max` size.
+  #
+  # @param vector_store_id [String] Identifier of the OpenAI vector store that
+  #   should receive the documents.
+  # @param dir [String] Directory to watch for changes (defaults to the current
+  #   working directory).
+  # @return [void]
   def watch(vector_store_id:, dir: ".")
     excludes = @cfg["excludes"]
     debounce_ms = Integer(@cfg["debounce_ms"])
@@ -110,6 +151,14 @@ class DocAsk
     sleep
   end
 
+  # Run a one-off question against the vector store by creating a temporary
+  # assistant wired to the specified store, posting a user message, waiting for
+  # completion, and streaming the resulting text to stdout.
+  #
+  # @param vector_store_id [String] Identifier of the OpenAI vector store to
+  #   query.
+  # @param question [String] Natural-language question to ask the assistant.
+  # @return [void]
   def ask(vector_store_id:, question:)
     asst = with_retries { @client.assistants.create(parameters: {
       model: "gpt-4.1-mini",
@@ -135,6 +184,13 @@ class DocAsk
   end
 
   # ============ internals ============
+  # Process a batch of queued operations, performing uploads or removals and
+  # logging aggregated results.
+  #
+  # @param vector_store_id [String] Identifier of the OpenAI vector store.
+  # @param ops [Array<Array>] Sequence of operation tuples of the form
+  #   `[:upsert, path]` or `[:remove, path]`.
+  # @return [void]
   def process_batch(vector_store_id, ops)
     return if ops.empty?
     updated = removed = 0
@@ -153,6 +209,13 @@ class DocAsk
     puts "batch: #{updated} updated, #{removed} removed"
   end
 
+  # Upload (or skip) a single file based on its SHA-256 digest, keeping the
+  # local state cache in sync. The method returns a symbol describing the
+  # action so callers can tally counts.
+  #
+  # @param vector_store_id [String] Identifier of the OpenAI vector store.
+  # @param path [String] Filesystem path to the candidate document.
+  # @return [:updated, :skipped, :error] Outcome of the upsert operation.
   def upsert_file(vector_store_id:, path:)
     return :skipped unless File.file?(path)
     state = load_state
@@ -170,6 +233,13 @@ class DocAsk
     :error
   end
 
+  # Remove a file record from the local cache and attempt to delete the
+  # corresponding file from the remote vector store. Missing cache entries are
+  # treated as no-ops.
+  #
+  # @param vector_store_id [String] Identifier of the OpenAI vector store.
+  # @param path [String] Filesystem path for the document that was deleted.
+  # @return [:removed, :missing] Outcome of the removal operation.
   def remove_file(vector_store_id:, path:)
     state = load_state
     rec = state["files"].delete(path)
@@ -183,6 +253,17 @@ class DocAsk
     :removed
   end
 
+  # Execute a block with retry semantics using exponential backoff and full
+  # jitter. Retry parameters are pulled from the current configuration.
+  #
+  # @param max [Integer, nil] Maximum number of attempts.
+  # @param base [Float, nil] Base delay in seconds for the first retry.
+  # @param cap [Float, nil] Maximum sleep duration between retries.
+  # @yield Executes the provided block until it returns or retries are
+  #   exhausted.
+  # @return [Object] Whatever value the block returns.
+  # @raise [Exception] Re-raises the most recent exception when retries are
+  #   exhausted.
   def with_retries(max: nil, base: nil, cap: nil)
     max ||= @retry_cfg["max_attempts"]
     base ||= @retry_cfg["base_delay"]
@@ -191,8 +272,8 @@ class DocAsk
     begin
       attempt += 1
       return yield
-    rescue => e
-      raise if attempt >= max
+    rescue => error
+      raise error if attempt >= max
       sleep_time = [cap, base * (2 ** (attempt - 1))].min
       # full jitter (0..sleep_time)
       sleep(rand * sleep_time)
@@ -200,10 +281,25 @@ class DocAsk
     end
   end
 
+  # Load a YAML configuration file if it exists, returning an empty hash when
+  # missing or unreadable. `nil` (common when the file is empty) is coerced to
+  # an empty hash to simplify callers.
+  #
+  # @param path [String] Path to the YAML file.
+  # @return [Hash] Parsed YAML (or an empty hash).
   def load_yaml(path)
     File.exist?(path) ? (YAML.load_file(path) || {}) : {}
   end
 
+  # Perform a best-effort update of a YAML file by loading its current content,
+  # yielding it to a block, and writing the merged hash back to disk. Any
+  # exceptions during write are swallowed intentionally to avoid breaking CLI
+  # flows for repositories where the file is not writable.
+  #
+  # @param path [String] Path to the YAML file to persist.
+  # @yieldparam current [Hash] The current YAML content (deep duped).
+  # @yieldreturn [Hash] The value that should be written back to disk.
+  # @return [void]
   def persist_yaml(path)
     base = load_yaml(path)
     merged = yield(base.dup)
@@ -212,28 +308,57 @@ class DocAsk
     # best-effort; skip if no permission
   end
 
+  # Load the local JSON state cache if present, otherwise return the empty
+  # structure DocAsk expects (`{"files" => {}}`).
+  #
+  # @return [Hash] State payload describing known files.
   def load_state
     File.exist?(STATE_FILE) ? JSON.parse(File.read(STATE_FILE)) : { "files" => {} }
   end
 
+  # Persist the given state hash to `STATE_FILE` using pretty-printed JSON for
+  # easier inspection while debugging.
+  #
+  # @param state [Hash] State payload to write.
+  # @return [void]
   def save_state(state)
     File.write(STATE_FILE, JSON.pretty_generate(state))
   end
 
+  # Compute a SHA-256 digest for the specified file path.
+  #
+  # @param path [String] Filesystem path to hash.
+  # @return [String] Hex-encoded digest.
   def sha256(path)
     Digest::SHA256.file(path).hexdigest
   end
 
+  # Determine whether a file should be indexed based on its extension.
+  #
+  # @param path [String] Candidate filesystem path.
+  # @return [Boolean] True if the file extension is supported.
   def indexable?(path)
     path =~ /\.(md|mdx|markdown|pdf)\z/i
   end
 
+  # Expand include globs, apply exclude filters, and return the resulting
+  # unique path list.
+  #
+  # @param includes [Array<String>] Glob patterns to include.
+  # @param excludes [Array<String>] Glob patterns to exclude.
+  # @return [Array<String>] Unique list of matching paths.
   def expand_globs(includes, excludes)
     inc_paths = includes.flat_map { |g| Dir[g] }.uniq
     reject = ->(p) { excludes.any? { |g| File.fnmatch?(g, p, File::FNM_PATHNAME | File::FNM_DOTMATCH | File::FNM_EXTGLOB) } }
     inc_paths.reject { |p| reject.call(p) }
   end
 
+  # Convert an array of glob patterns into a single regular expression that can
+  # be consumed by `Listen`'s `ignore:` option.
+  #
+  # @param globs [Array<String>] Glob patterns to transform.
+  # @return [Regexp, nil] Combined regular expression, or `nil` when the array
+  #   is empty.
   def ignores_to_regex(globs)
     # Convert exclude globs to a single regex for Listen
     parts = globs.map do |g|
